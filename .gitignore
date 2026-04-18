@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.pyc
+
+# Logs
+*.csv
+
+# Models
+*.pt
+*.onnx
+*.engine
+
+# Checkpoints
+checkpoints/
+best_model/
+
+# Results
+results_plots/
+
+# Large files
+*.zip
+*.whl
+
+# SSH keys
+github
+github.pub

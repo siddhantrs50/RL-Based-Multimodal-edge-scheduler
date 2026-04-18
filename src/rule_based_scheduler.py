@@ -1,212 +1,227 @@
+"""
+rule_based_scheduler.py — Threshold-driven precision scheduler
+                           Jetson Orin NX 8 GB / AVerMedia D115
+
+Logs per iteration:
+  timestamp, gpu_temp, cpu_temp, gpu_util, power, ram,
+  system_state, decision, yolo_precision, bert_precision,
+  yolo_latency_ms, bert_latency_ms, total_latency_ms,
+  fps, throughput_tasks_per_sec, energy_per_inf_j,
+  scheduler_overhead_ms, cost_function
+"""
+
 import time
-import threading
-import subprocess
 import csv
 import random
+import numpy as np
+import cv2
+import psutil
 from datetime import datetime
-import torch
-from transformers import DistilBertTokenizer, DistilBertModel
+from ultralytics import YOLO
 
-from telemetry_reader import read_tegrastats, parse_tegrastats
+from bert_infer import BertTRTInference
+from telemetry_reader import read_tegrastats, parse_tegrastats, classify_state
 
-# -----------------------------
-# CSV SETUP
-# -----------------------------
-CSV_FILE = "rule_based_log.csv"
 
-with open(CSV_FILE, "w", newline="") as f:
-    writer = csv.writer(f)
-    writer.writerow([
-        "timestamp",
-        "gpu_temp",
-        "gpu_util",
-        "power",
-        "ram",
-        "decision",
-        "yolo_run",
-        "bert_run"
-    ])
+# ─────────────────────────────────────────────
+# Thesis cost function  C = α(1−A) + βL + γE + δT
+# ─────────────────────────────────────────────
+ALPHA, BETA, GAMMA, DELTA = 0.4, 0.3, 0.2, 0.1
 
-# -----------------------------
-# LOAD BERT (ONLY ONCE)
-# -----------------------------
-print("Loading DistilBERT...")
+ACCURACY = {
+    "YOLO_FP16+BERT_FP16": 1.00,
+    "YOLO_INT8+BERT_FP16": 0.88,
+    "YOLO_FP16+BERT_INT8": 0.90,
+    "YOLO_INT8+BERT_INT8": 0.80,
+}
 
-tokenizer = DistilBertTokenizer.from_pretrained("distilbert-base-uncased")
-model = DistilBertModel.from_pretrained("distilbert-base-uncased")
+def cost_function(decision, latency_ms, energy_j, temp_c):
+    acc = ACCURACY.get(decision, 0.85)
+    return (ALPHA * (1 - acc) +
+            BETA  * (latency_ms / 1000.0) +
+            GAMMA * energy_j +
+            DELTA * (temp_c / 100.0))
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-model.to(device)
-model.eval()
 
-print("BERT loaded successfully\n")
+# ─────────────────────────────────────────────
+# Load all 4 engines
+# ─────────────────────────────────────────────
+print("Loading YOLO engines...")
+yolo_engines = {
+    "fp16": YOLO("engines/yolov8_fp16.engine"),
+    "int8": YOLO("engines/yolov8_int8.engine"),
+}
+print("Loading BERT engines...")
+bert_engines = {
+    "fp16": BertTRTInference("engines/bert_fp16.engine"),
+    "int8": BertTRTInference("engines/bert_int8.engine"),
+}
+print("All engines loaded.\n")
 
-# -----------------------------
-# TEXT POOL (RANDOM NLP LOAD)
-# -----------------------------
+# ─────────────────────────────────────────────
+# Webcam
+# ─────────────────────────────────────────────
+cap = cv2.VideoCapture(0)
+cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+cap.set(cv2.CAP_PROP_FPS, 30)
+if not cap.isOpened():
+    print("[WARN] Webcam not available — using random frames")
+    cap = None
+
+def get_frame():
+    if cap is not None:
+        ret, frame = cap.read()
+        if ret:
+            return frame
+    return np.random.randint(0, 255, (480, 640, 3), dtype=np.uint8)
+
 TEXT_POOL = [
-    "Edge AI systems require efficient scheduling under constraints.",
-    "Real time object detection is computationally intensive.",
-    "Transformers are widely used for natural language processing tasks.",
-    "Jetson devices enable deployment of deep learning models at the edge.",
-    "Thermal management is critical in embedded AI systems.",
-    "Multimodal workloads combine vision and language processing.",
-    "Reinforcement learning can optimize scheduling decisions dynamically.",
-    "Latency and power consumption must be balanced carefully.",
-    "Efficient inference pipelines are required for edge deployment.",
-    "Resource constrained devices require intelligent workload management."
+    "Rule-based scheduling uses fixed thresholds for precision decisions.",
+    "Thermal limits trigger precision downgrade on Jetson Orin NX board.",
+    "Edge AI systems need adaptive inference under resource constraints.",
+    "INT8 quantization reduces power consumption significantly at edge.",
+    "TensorRT engines enable fast switching between FP16 and INT8 modes.",
+    "Dynamic model compression improves energy efficiency on embedded boards.",
+    "Multimodal scheduling balances vision and language workloads well.",
+    "Real-time telemetry guides adaptive precision switching decisions.",
+    "YOLOv8 object detection runs efficiently with TensorRT optimization.",
+    "DistilBERT provides lightweight NLP inference for edge deployment.",
 ]
 
-# -----------------------------
-# YOLO (WEBCAM BURST MODE)
-# -----------------------------
-def run_yolo():
-    process = subprocess.Popen(
-        [
-            "yolo",
-            "predict",
-            "model=yolov8n.pt",
-            "source=0",
-            "device=0",
-            "show=False",
-            "save=False",
-            "stream=True"
-        ],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL
-    )
+# ─────────────────────────────────────────────
+# CSV
+# ─────────────────────────────────────────────
+CSV_FILE = "rule_based_log.csv"
+FIELDNAMES = [
+    "timestamp", "gpu_temp", "cpu_temp", "gpu_util", "power", "ram",
+    "system_state", "decision", "yolo_precision", "bert_precision",
+    "yolo_latency_ms", "bert_latency_ms", "total_latency_ms",
+    "fps", "throughput_tasks_per_sec", "energy_per_inf_j",
+    "scheduler_overhead_ms", "cost_function"
+]
+with open(CSV_FILE, "w", newline="") as f:
+    csv.writer(f).writerow(FIELDNAMES)
 
-    time.sleep(3)
-    process.terminate()
+YOLO_RUNS = 8
+BERT_RUNS = 8
 
-# -----------------------------
-# BERT (RANDOMIZED LOAD)
-# -----------------------------
-def run_bert():
-    text = random.choice(TEXT_POOL)
-    seq_len = random.choice([32, 64, 128])
 
-    with torch.no_grad():
-        inputs = tokenizer(
-            text,
-            return_tensors="pt",
-            max_length=seq_len,
-            truncation=True
-        )
-        inputs = {k: v.to(device) for k, v in inputs.items()}
-        _ = model(**inputs)
+def run_yolo(precision):
+    latencies = []
+    for _ in range(YOLO_RUNS):
+        frame = get_frame()
+        t0 = time.time()
+        yolo_engines[precision].predict(
+            source=frame, device=0, verbose=False, imgsz=640)
+        latencies.append((time.time() - t0) * 1000)
+    return float(np.mean(latencies))
 
-# -----------------------------
-# IMPROVED SCHEDULER LOGIC
-# -----------------------------
-def scheduler_decision(state):
-    temp = state.get("gpu_temp_c", 0)
-    gpu = state.get("gpu_util_percent", 0)
-    ram = state.get("ram_used_mb", 0)
 
-    # Exploration (prevents starvation)
-    if random.random() < 0.2:
-        return "RUN_BOTH"
+def run_bert(precision):
+    latencies = []
+    for _ in range(BERT_RUNS):
+        t0 = time.time()
+        bert_engines[precision].infer(random.choice(TEXT_POOL))
+        latencies.append((time.time() - t0) * 1000)
+    return float(np.mean(latencies))
 
-    if temp > 75:
-        return "SKIP_YOLO"
-    elif gpu > 95:
-        return "DELAY_BERT"
-    elif ram > 5000:
-        return "DELAY_BERT"
+
+def decide(state):
+    """
+    Thesis Phase 3 rule-based decision logic.
+    Returns (decision_label, yolo_precision, bert_precision)
+    """
+    temp  = state.get("gpu_temp_c",       0.0)
+    cpu_t = state.get("cpu_temp_c",        0.0)
+    gpu   = state.get("gpu_util_percent",  0.0)
+    power = state.get("power_w",           0.0)
+
+    # Critical state → full INT8
+    if temp > 75.0 or cpu_t > 75.0 or power > 10.0:
+        return "YOLO_INT8+BERT_INT8",  "int8", "int8"
+    # High Load → reduce heavier model (YOLO) first
+    elif temp > 65.0 or cpu_t > 65.0 or gpu > 85.0:
+        return "YOLO_INT8+BERT_FP16", "int8", "fp16"
+    # Moderate load → reduce lighter model (BERT)
+    elif gpu > 70.0:
+        return "YOLO_FP16+BERT_INT8", "fp16", "int8"
+    # Normal → full FP16
     else:
-        return "RUN_BOTH"
+        return "YOLO_FP16+BERT_FP16", "fp16", "fp16"
 
-# -----------------------------
-# MAIN LOOP (100 ITERATIONS)
-# -----------------------------
-if __name__ == "__main__":
 
-    MAX_ITERATIONS = 100
+MAX_ITERATIONS = 100
+proc = psutil.Process()
 
-    print("Starting Rule-Based Scheduler (100 iterations)\n")
+print(f"Rule-Based Precision Scheduler")
+print(f"Intensity: {YOLO_RUNS} YOLO + {BERT_RUNS} BERT per iteration\n")
 
-    try:
-        for iteration in range(MAX_ITERATIONS):
+try:
+    for i in range(MAX_ITERATIONS):
+        print(f"\n--- Iteration {i+1}/{MAX_ITERATIONS} ---")
 
-            print(f"\n--- Iteration {iteration+1}/{MAX_ITERATIONS} ---")
+        raw   = read_tegrastats()
+        state = parse_tegrastats(raw)
+        if not state:
+            time.sleep(0.2)
+            continue
 
-            # -----------------------------
-            # READ TELEMETRY
-            # -----------------------------
-            raw = read_tegrastats()
-            state = parse_tegrastats(raw)
+        sys_state = classify_state(state)
 
-            if not state:
-                time.sleep(1)
-                continue
+        # Measure scheduler overhead
+        t_sched = time.time()
+        decision, yolo_prec, bert_prec = decide(state)
+        sched_overhead_ms = (time.time() - t_sched) * 1000
 
-            print(f"State: {state}")
+        yolo_lat  = run_yolo(yolo_prec)
+        bert_lat  = run_bert(bert_prec)
+        total_lat = yolo_lat + bert_lat
 
-            # -----------------------------
-            # DECISION
-            # -----------------------------
-            decision = scheduler_decision(state)
-            print(f"Decision: {decision}")
+        fps        = 1000.0 / yolo_lat
+        throughput = (YOLO_RUNS + BERT_RUNS) / (total_lat / 1000.0)
+        power      = state.get("power_w", 0.0)
+        temp_c     = state.get("gpu_temp_c", 50.0)
+        energy_j   = (power * total_lat) / 1000.0
+        cost       = cost_function(decision, total_lat, energy_j, temp_c)
 
-            yolo_run = 0
-            bert_run = 0
+        print(f"State     : {sys_state} | "
+              f"GPU={state.get('gpu_temp_c',0):.1f}°C "
+              f"CPU={state.get('cpu_temp_c',0):.1f}°C "
+              f"GPU_UTIL={state.get('gpu_util_percent',0):.0f}% "
+              f"PWR={power:.2f}W")
+        print(f"Decision  : {decision} | Overhead: {sched_overhead_ms:.3f}ms")
+        print(f"YOLO({yolo_prec.upper()}): {yolo_lat:.1f}ms | "
+              f"BERT({bert_prec.upper()}): {bert_lat:.1f}ms | "
+              f"FPS: {fps:.1f} | Energy: {energy_j:.4f}J | Cost: {cost:.4f}")
 
-            # -----------------------------
-            # APPLY DECISION
-            # -----------------------------
-            if decision == "SKIP_YOLO":
-                print("→ Running BERT only")
-                run_bert()
-                bert_run = 1
+        with open(CSV_FILE, "a", newline="") as f:
+            csv.writer(f).writerow([
+                datetime.now().strftime("%H:%M:%S"),
+                state.get("gpu_temp_c",       ""),
+                state.get("cpu_temp_c",        ""),
+                state.get("gpu_util_percent",  ""),
+                state.get("power_w",           ""),
+                state.get("ram_used_mb",       ""),
+                sys_state,
+                decision,
+                yolo_prec, bert_prec,
+                f"{yolo_lat:.2f}",
+                f"{bert_lat:.2f}",
+                f"{total_lat:.2f}",
+                f"{fps:.2f}",
+                f"{throughput:.2f}",
+                f"{energy_j:.4f}",
+                f"{sched_overhead_ms:.4f}",
+                f"{cost:.4f}",
+            ])
 
-            elif decision == "DELAY_BERT":
-                print("→ Running YOLO only")
-                run_yolo()
-                yolo_run = 1
+        time.sleep(0.2)
 
-            elif decision == "RUN_BOTH":
-                print("→ Running YOLO + BERT")
+except KeyboardInterrupt:
+    print("\nRule-based scheduler stopped.")
+finally:
+    if cap is not None:
+        cap.release()
 
-                yolo_thread = threading.Thread(target=run_yolo)
-                bert_thread = threading.Thread(target=run_bert)
-
-                yolo_thread.start()
-                bert_thread.start()
-
-                yolo_thread.join()
-                bert_thread.join()
-
-                yolo_run = 1
-                bert_run = 1
-
-            # -----------------------------
-            # LOG CSV
-            # -----------------------------
-            timestamp = datetime.now().strftime("%H:%M:%S")
-
-            temp = state.get("gpu_temp_c", 0)
-            gpu = state.get("gpu_util_percent", 0)
-            power = state.get("power_w", 0)
-            ram = state.get("ram_used_mb", 0)
-
-            with open(CSV_FILE, "a", newline="") as f:
-                writer = csv.writer(f)
-                writer.writerow([
-                    timestamp,
-                    temp,
-                    gpu,
-                    power,
-                    ram,
-                    decision,
-                    yolo_run,
-                    bert_run
-                ])
-
-            time.sleep(1)
-
-        print("\nCompleted 100 iterations successfully.")
-        print(f"CSV saved as: {CSV_FILE}")
-
-    except KeyboardInterrupt:
-        print("\nScheduler stopped early.")
+print(f"\nDone. Log: {CSV_FILE}")
