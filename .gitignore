@@ -3,7 +3,7 @@ __pycache__/
 *.pyc
 
 # Logs
-*.csv
+
 
 # Models
 *.pt
@@ -15,7 +15,7 @@ checkpoints/
 best_model/
 
 # Results
-results_plots/
+
 
 # Large files
 *.zip
